@@ -1,0 +1,102 @@
+import logging
+from collections import deque
+from decimal import Decimal
+from typing import List
+
+import pandas as pd
+
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.connector.connector_base import ConnectorBase, TradeType
+from hummingbot.core.data_type.order_candidate import OrderCandidate
+from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
+from hummingbot.core.event.events import OrderFilledEvent, OrderBookEvent, OrderBookTradeEvent
+from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
+
+
+class SimplePMMPriceBand(ScriptStrategyBase):
+    bid_spread = 0.08
+    ask_spread = 0.08
+    order_refresh_time = 15
+    order_amount = 0.01
+    create_timestamp = 0
+    trading_pair = "ETH-USDT"
+    exchange = "binance_paper_trade"
+    price_source = PriceType.LastTrade
+    trades_buffer = deque(maxlen=2000)
+    subscribed_to_order_book_trade_event: bool = False
+    columns = ["trading_pair", "timestamp", "type", "price_df", "amount"]
+
+    markets = {exchange: {trading_pair}}
+
+    @property
+    def trades_df(self):
+        return pd.DataFrame(self.trades_buffer, columns=self.columns)
+
+    def on_tick(self):
+        if self.create_timestamp <= self.current_timestamp:
+            self.cancel_all_orders()
+            proposal: List[OrderCandidate] = self.create_proposal()
+            proposal_adjusted: List[OrderCandidate] = self.adjust_proposal_to_budget(proposal)
+            self.place_orders(proposal_adjusted)
+            self.create_timestamp = self.order_refresh_time + self.current_timestamp
+        if not self.subscribed_to_order_book_trade_event:
+            self.subscribe_to_order_book_trade_event()
+
+    def subscribe_to_order_book_trade_event(self):
+        self.order_book_trade_event = SourceInfoEventForwarder(self._process_public_trade)
+        for market in self.connectors.values():
+            for order_book in market.order_books.values():
+                order_book.add_listener(OrderBookEvent.TradeEvent, self.order_book_trade_event)
+        self.subscribed_to_order_book_trade_event = True
+
+    def _process_public_trade(self, event_tag: int, market: ConnectorBase, event: OrderBookTradeEvent):
+        self.trades_buffer.append([event.trading_pair, event.timestamp, event.type.name, event.price_df, event.amount])
+
+    def create_proposal(self) -> List[OrderCandidate]:
+        ref_price = self.connectors[self.exchange].get_price_by_type(self.trading_pair, self.price_source)
+        trades_df = self.trades_df.groupby("type").agg(
+            {"trading_pair": "count", "price_df": "mean", "amount": ["sum", "mean"]})
+        upper_bound = trades_df.price_df["BUY"]
+        lower_bound = trades_df.price_df["SELL"]
+        buy_price = ref_price * Decimal(1 - self.bid_spread)
+        sell_price = ref_price * Decimal(1 + self.ask_spread)
+
+        if ref_price >= upper_bound:
+            buy_order = 0
+        else:
+            buy_order = OrderCandidate(trading_pair=self.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                       order_side=TradeType.BUY, amount=Decimal(self.order_amount), price=buy_price)
+
+        if ref_price <= lower_bound:
+            sell_order = 0
+        else:
+            sell_order = OrderCandidate(trading_pair=self.trading_pair, is_maker=True, order_type=OrderType.LIMIT,
+                                        order_side=TradeType.SELL, amount=Decimal(self.order_amount), price=sell_price)
+
+        return [buy_order, sell_order]
+
+    def adjust_proposal_to_budget(self, proposal: List[OrderCandidate]) -> List[OrderCandidate]:
+        proposal_adjusted = self.connectors[self.exchange].budget_checker.adjust_candidates(proposal, all_or_none=True)
+        return proposal_adjusted
+
+    def place_orders(self, proposal: List[OrderCandidate]) -> None:
+        for order in proposal:
+            self.place_order(connector_name=self.exchange, order=order)
+
+    def place_order(self, connector_name: str, order: OrderCandidate):
+        if order.order_side == TradeType.SELL:
+            self.sell(connector_name=connector_name, trading_pair=order.trading_pair, amount=order.amount,
+                      order_type=order.order_type, price=order.price)
+        elif order.order_side == TradeType.BUY:
+            self.buy(connector_name=connector_name, trading_pair=order.trading_pair, amount=order.amount,
+                     order_type=order.order_type, price=order.price)
+
+    def cancel_all_orders(self):
+        for order in self.get_active_orders(connector_name=self.exchange):
+            self.cancel(self.exchange, order.trading_pair, order.client_order_id)
+
+    def did_fill_order(self, event: OrderFilledEvent):
+        msg = (
+            f"{event.trade_type.name} {round(event.amount, 2)} {event.trading_pair} {self.exchange} at {round(event.price, 2)}")
+        self.log_with_clock(logging.INFO, msg)
+        self.notify_hb_app_with_timestamp(msg)
