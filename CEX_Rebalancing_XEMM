@@ -36,7 +36,6 @@ class RebalancingXEMM(ScriptStrategyBase):
     sell_order_placed = False
 
     def on_tick(self):
-    #set tick size to 200 ms
         taker_buy_result = self.connectors[self.taker_exchange].get_price_for_volume(self.taker_pair, True,
                                                                                      self.order_amount)
         taker_sell_result = self.connectors[self.taker_exchange].get_price_for_volume(self.taker_pair, False,
@@ -270,7 +269,3 @@ class RebalancingXEMM(ScriptStrategyBase):
             lines.extend(["", "  No active maker orders."])
 
         return "\n".join(lines)
-
-        # Calculate base-asset percentage
-        # If base-asset pct <10, create rebalancing trade
-        # Last Prices for taker exchage still missing (maybe vwap) currently price for volume
