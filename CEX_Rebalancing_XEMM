@@ -1,4 +1,3 @@
-
 import numpy as np
 import pandas as pd
 from hummingbot.connector.connector_base import Decimal, TradeType, OrderType, OrderFilledEvent, List
@@ -9,7 +8,7 @@ from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 
 class RebalancingXEMM(ScriptStrategyBase):
-    maker_exchange = "gate_io_paper_trade"
+    maker_exchange = "ascend_ex_paper_trade"
     taker_exchange = "binance_paper_trade"
     maker_base = "AVAX"
     maker_quote = "USDT"
@@ -19,15 +18,14 @@ class RebalancingXEMM(ScriptStrategyBase):
     slippage_buffer_spread_bps = 5
     maker_pair = f"{maker_base}-{maker_quote}"
     taker_pair = f"{taker_base}-{taker_quote}"
-    target_base_asset_pct = 0.3
-    rebalancing_hurdle = 0.1 #at this pct of base asset the bot starts rebalancing
+    target_base_asset_percentage = 0.5
+    rebalancing_pct = 0.2
 
     markets = {maker_exchange: {maker_pair}, taker_exchange: {taker_pair}}
 
     order_amount: int = 10
-    exp_profit_bps_buy: int = 40
-    exp_profit_bps_sell: int = 40
-    min_profit_bps: int = 15
+    exp_profit_bps: int = 35
+    min_spread_bps: int = 15
     fee_bps: int = 20
 
     max_order_age = 120
@@ -42,7 +40,7 @@ class RebalancingXEMM(ScriptStrategyBase):
                                                                                       self.order_amount)
 
         if not self.buy_order_placed:
-            maker_buy_price = taker_sell_result.result_price * Decimal(1 - self.exp_profit_bps_buy / 10000
+            maker_buy_price = taker_sell_result.result_price * Decimal(1 - self.exp_profit_bps / 10000
                                                                        - self.fee_bps / 10000)
             buy_order_amount = min(self.order_amount, self.buy_hedging_budget())
             buy_order = OrderCandidate(trading_pair=self.maker_pair, is_maker=True, order_type=OrderType.LIMIT,
@@ -55,7 +53,7 @@ class RebalancingXEMM(ScriptStrategyBase):
             self.buy_order_placed = True
 
         if not self.sell_order_placed:
-            maker_sell_price = taker_buy_result.result_price * Decimal(1 + self.exp_profit_bps_sell / 10000
+            maker_sell_price = taker_buy_result.result_price * Decimal(1 + self.exp_profit_bps / 10000
                                                                        + self.fee_bps / 10000)
             sell_order_amount = min(self.order_amount, self.sell_hedging_budget())
             sell_order = OrderCandidate(trading_pair=self.maker_pair, is_maker=True, order_type=OrderType.LIMIT,
@@ -70,15 +68,13 @@ class RebalancingXEMM(ScriptStrategyBase):
         for order in self.get_active_orders(connector_name=self.maker_exchange):
             cancel_timestamp = order.creation_timestamp / 1000000 + self.max_order_age
             if order.is_buy:
-                buy_cancel_threshold = taker_sell_result.result_price * Decimal(1 - self.min_profit_bps / 10000
-                                                                                - self.fee_bps / 10000)
+                buy_cancel_threshold = taker_sell_result.result_price * Decimal(1 - self.min_spread_bps / 10000)
                 if order.price > buy_cancel_threshold or cancel_timestamp < self.current_timestamp:
                     self.logger().info(f"Cancelling buy order: {order.client_order_id}")
                     self.cancel(self.maker_exchange, order.trading_pair, order.client_order_id)
                     self.buy_order_placed = False
             else:
-                sell_cancel_threshold = taker_buy_result.result_price * Decimal(1 + self.min_profit_bps / 10000
-                                                                                + self.fee_bps / 10000)
+                sell_cancel_threshold = taker_buy_result.result_price * Decimal(1 + self.min_spread_bps / 10000)
                 if order.price < sell_cancel_threshold or cancel_timestamp < self.current_timestamp:
                     self.logger().info(f"Cancelling sell order: {order.client_order_id}")
                     self.cancel(self.maker_exchange, order.trading_pair, order.client_order_id)
@@ -110,26 +106,47 @@ class RebalancingXEMM(ScriptStrategyBase):
         maker_connector = self.connectors[self.maker_exchange]
         return maker_connector
 
-    def base_asset_pct_maker (self):
+    def base_asset_maker_pct(self):
         base_asset_maker_exchange = self.maker_connector.get_balance(self.maker_base)
         base_asset_maker_pct = base_asset_maker_exchange / \
-                               (base_asset_maker_exchange + self.maker_connector.get_balance(self.maker_quote))
+                               (base_asset_maker_exchange + self.maker_connector.get_balance(self.maker_quote) *
+                                self.connectors[self.maker_exchange].get_price_for_volume(self.maker_pair,
+                                                                                          True, self.order_amount))
         return base_asset_maker_pct
 
-    def profit_adjustment (self):
-        if self.base_asset_pct_maker() > self.target_base_asset_pct \
-                or self.base_asset_pct_maker() < (1 - self.target_base_asset_pct):
-            pass
-            if self.base_asset_pct_maker() < self.rebalancing_hurdle:
-                exp_profit_bps_buy = 5
-                exp_profit_bps_sell = 100
-            elif self.base_asset_pct_maker() > (1 - self.rebalancing_hurdle):
-                exp_profit_bps_buy = 100
-                exp_profit_bps_sell = 5
-            else:
-                exp_profit_bps_buy = 40
-                exp_profit_bps_sell = 40
-            return exp_profit_bps_buy, exp_profit_bps_sell
+    @property
+    def taker_connector(self):
+        taker_connector = self.connectors[self.taker_exchange]
+        return taker_connector
+
+    def rebalancing(self):
+        total_balance_maker = self.maker_connector.get_balance(self.maker_base) + \
+                              (self.maker_connector.get_balance(self.maker_quote) *
+                               self.connectors[self.maker_exchange].get_price_for_volume(self.maker_pair, True,
+                                                                                         self.order_amount))
+        total_balance_taker = self.taker_connector.get_balance(self.taker_base) + \
+                              (self.taker_connector.get_balance(self.taker_quote) *
+                               self.connectors[self.taker_exchange].get_price_for_volume(self.taker_pair, True,
+                                                                                         self.order_amount))
+        if self.base_asset_maker_pct() < self.target_base_asset_percentage:
+            self.buy(self.maker_connector, self.maker_pair, (total_balance_maker * self.rebalancing_pct),
+                     order_type=OrderType.MARKET,
+                     price=self.connectors[self.maker_exchange].get_price_for_volume(self.maker_pair, True,
+                                                                                     self.order_amount))
+            self.sell(self.taker_connector, self.taker_pair, (total_balance_taker * self.rebalancing_pct),
+                      order_type=OrderType.MARKET,
+                      price=self.connectors[self.taker_exchange].get_price_for_volume(self.taker_pair, True,
+                                                                                      self.order_amount))
+
+        if self.base_asset_maker_pct() > self.target_base_asset_percentage:
+            self.sell(self.maker_connector, self.maker_pair, (total_balance_maker * self.rebalancing_pct),
+                      order_type=OrderType.MARKET,
+                      price=self.connectors[self.maker_exchange].get_price_for_volume(self.maker_pair, True,
+                                                                                      self.order_amount))
+            self.buy(self.taker_connector, self.taker_pair, (total_balance_taker * self.rebalancing_pct),
+                     order_type=OrderType.MARKET,
+                     price=self.connectors[self.taker_exchange].get_price_for_volume(self.taker_pair, True,
+                                                                                     self.order_amount))
 
     def did_fill_order(self, event: OrderFilledEvent):
 
@@ -219,8 +236,8 @@ class RebalancingXEMM(ScriptStrategyBase):
                                                                                      self.order_amount)
         taker_sell_result = self.connectors[self.taker_exchange].get_price_for_volume(self.taker_pair, False,
                                                                                       self.order_amount)
-        buy_cancel_threshold = taker_sell_result.result_price * Decimal(1 - self.min_profit_bps / 10000)
-        sell_cancel_threshold = taker_buy_result.result_price * Decimal(1 + self.min_profit_bps / 10000)
+        buy_cancel_threshold = taker_sell_result.result_price * Decimal(1 - self.min_spread_bps / 10000)
+        sell_cancel_threshold = taker_buy_result.result_price * Decimal(1 + self.min_spread_bps / 10000)
         for connector_name, connector in self.connectors.items():
             for order in self.get_active_orders(connector_name):
                 age_txt = "n/a" if order.age() <= 0. else pd.Timestamp(order.age(), unit='s').strftime('%H:%M:%S')
